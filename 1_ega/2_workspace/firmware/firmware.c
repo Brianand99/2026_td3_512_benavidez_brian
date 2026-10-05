@@ -6,7 +6,6 @@
 #include <string.h>
 #include "pico/stdlib.h"
 #include "hardware/adc.h"
-#include "hardware/irq.h"
 #include "hardware/i2c.h"
 #include "hardware/pwm.h"
 #include "hardware/clocks.h"
@@ -62,9 +61,9 @@
 #define DISPLAY_UPDATE_MS 100U
 #define UART_PERIOD_MS 2U
 
-#define VOLTAGE_SETPOINT_MIN 5.0f
+#define VOLTAGE_SETPOINT_MIN 0.0f
 #define VOLTAGE_SETPOINT_MAX 30.0f
-#define VOLTAGE_SETPOINT_INITIAL 10.0f
+#define VOLTAGE_SETPOINT_INITIAL 5.0f
 #define VOLTAGE_SETPOINT_STEP 0.5f
 #define MAXIMUM_VOLTAGE_REFERENCE 30.0f
 #define VOUT_OVERVOLTAGE_TRIP 40.0f
@@ -78,12 +77,9 @@
 #define CURRENT_SHUNT_OHMS 0.100f
 #define CURRENT_SENSE_GAIN (1.0f + 200000.0f / 22000.0f)
 #define CURRENT_POS_ZERO_VOLTS 0.0388f
-#define CURRENT_FILTER_ALPHA 0.35f
-
 #define CURRENT2_SHUNT_OHMS 0.100f
 #define CURRENT2_SENSE_GAIN (200000.0f / 20000.0f)
 #define CURRENT_NEG_ZERO_VOLTS 0.0015f
-#define CURRENT2_FILTER_ALPHA 0.35f
 #define CURRENT_ZERO_DEADBAND_AMPS 0.010f
 
 #define DUTY_MIN_PERCENT 0.0f
@@ -93,8 +89,6 @@
 
 #define PID_KP 0.80f
 #define PID_KI 2.00f
-
-#define VOLTAGE_FILTER_ALPHA 0.40f
 
 #define VIN_ADC_GPIO 26
 #define VIN_ADC_CHANNEL 0
@@ -154,26 +148,6 @@ typedef struct {
 } power_measurements_t;
 
 typedef struct {
-    power_measurements_t measurements;
-    float duty_percent;
-    float duty_percent2;
-    float voltage_setpoint;
-    float voltage_setpoint2;
-    bool output_enabled;
-    bool output_enabled2;
-    bool overvoltage_fault;
-    bool overvoltage_fault2;
-    bool overcurrent_fault;
-    bool overcurrent_fault2;
-    float overcurrent_limit;
-    float overcurrent_limit2;
-    float overvoltage_limit;
-    float overvoltage_limit2;
-    uint8_t edit_mode;
-    uint8_t edit_mode2;
-} system_snapshot_t;
-
-typedef struct {
     float voltage_setpoint;
     float voltage_setpoint2;
     bool output_enabled;
@@ -213,15 +187,9 @@ static volatile bool overvoltage_fault2_latched = false;
 static volatile bool overcurrent_fault_latched = false;
 static volatile bool overcurrent_fault2_latched = false;
 static volatile uint16_t adc_latest_raw[3] = {0U, 0U, 0U};
-static volatile uint16_t overcurrent_raw_limit = ADC_MAX_VALUE;
-static volatile uint16_t overcurrent_raw_limit2 = ADC_MAX_VALUE;
 static volatile encoder_edit_mode_t encoder_edit_mode[2] = {EDIT_VOLTAGE_SETPOINT, EDIT_VOLTAGE_SETPOINT};
 
-static uint16_t previous_vin_raw = 0U;
-static uint16_t vin_fast_drop_raw = 0U;
-static uint16_t vin_fast_drop_min_raw = 0U;
-static volatile uint8_t adc_active_channel = VIN_ADC_CHANNEL;
-static volatile bool adc_sample_valid = false;
+static float previous_vin = 0.0f;
 
 static control_settings_t control_settings = {.voltage_setpoint = VOLTAGE_SETPOINT_INITIAL, .voltage_setpoint2 = VOLTAGE_SETPOINT_INITIAL, .output_enabled = false, .output_enabled2 = false};
 
@@ -247,160 +215,29 @@ static float clamp_float(float value, float minimum, float maximum) {
     return value;
 }
 
-static uint16_t current_limit_to_raw(float limit_amps, float shunt_ohms, float amplifier_gain, float zero_volts) {
-    float pin_voltage = zero_volts + limit_amps * shunt_ohms * amplifier_gain;
-    float raw = pin_voltage * ADC_MAX_VALUE / ADC_REFERENCE_VOLTAGE;
-    return (uint16_t)clamp_float(raw, 0.0f, ADC_MAX_VALUE);
-}
-
-static void update_measurements(const power_measurements_t *measurements) {
-    taskENTER_CRITICAL();
-    latest_measurements = *measurements;
-    taskEXIT_CRITICAL();
-}
-
-static power_measurements_t get_latest_measurements(void) {
-    power_measurements_t copy;
-    taskENTER_CRITICAL();
-    copy = latest_measurements;
-    taskEXIT_CRITICAL();
-    return copy;
-}
-
-static control_settings_t get_control_settings(void) {
-    control_settings_t copy;
-    taskENTER_CRITICAL();
-    copy = control_settings;
-    taskEXIT_CRITICAL();
-    return copy;
-}
-
-static bool current_limit_value_valid(float value) {
-    if (!isfinite(value) || value < CURRENT_LIMIT_MIN_AMPS || value > CURRENT_LIMIT_MAX_AMPS) {
-        return false;
-    }
-    float steps = roundf((value - CURRENT_LIMIT_MIN_AMPS) / CURRENT_LIMIT_STEP_AMPS);
-    float quantized = CURRENT_LIMIT_MIN_AMPS + steps * CURRENT_LIMIT_STEP_AMPS;
-    return fabsf(value - quantized) < 0.001f;
-}
-
-static runtime_settings_t get_runtime_settings(void) {
-    runtime_settings_t copy;
-    taskENTER_CRITICAL();
-    copy = runtime_settings;
-    taskEXIT_CRITICAL();
-    return copy;
-}
-
-static void encoder_adjust_selected(uint8_t encoder_index, int direction) {
-    float *setpoint;
-    float *current_limit;
-    float *voltage_limit;
+static void lcd_show_values(void) {
+    power_measurements_t measurements;
+    control_settings_t settings;
+    runtime_settings_t limits;
+    bool overvoltage_fault;
+    bool overvoltage_fault2;
+    bool overcurrent_fault;
+    bool overcurrent_fault2;
+    encoder_edit_mode_t edit_mode;
+    encoder_edit_mode_t edit_mode2;
 
     taskENTER_CRITICAL();
-    if (encoder_index == 0U) {
-        setpoint = &control_settings.voltage_setpoint;
-        current_limit = &runtime_settings.overcurrent_limit;
-        voltage_limit = &runtime_settings.overvoltage_limit;
-    } else {
-        setpoint = &control_settings.voltage_setpoint2;
-        current_limit = &runtime_settings.overcurrent_limit2;
-        voltage_limit = &runtime_settings.overvoltage_limit2;
-    }
-    switch (encoder_edit_mode[encoder_index]) {
-        case EDIT_CURRENT_LIMIT:
-            *current_limit = clamp_float(*current_limit + (float)direction * CURRENT_LIMIT_STEP_AMPS, CURRENT_LIMIT_MIN_AMPS, CURRENT_LIMIT_MAX_AMPS);
-            if (encoder_index == 0U) {
-                overcurrent_raw_limit = current_limit_to_raw(*current_limit, CURRENT_SHUNT_OHMS, CURRENT_SENSE_GAIN, CURRENT_POS_ZERO_VOLTS);
-            } else {
-                overcurrent_raw_limit2 = current_limit_to_raw(*current_limit, CURRENT2_SHUNT_OHMS, CURRENT2_SENSE_GAIN, CURRENT_NEG_ZERO_VOLTS);
-            }
-            break;
-        case EDIT_OVERVOLTAGE_LIMIT:
-            *voltage_limit = clamp_float(*voltage_limit + (float)direction * OVERVOLTAGE_LIMIT_STEP_VOLTS, OVERVOLTAGE_LIMIT_MIN_VOLTS, VOUT_OVERVOLTAGE_TRIP);
-            if (*setpoint > *voltage_limit) {
-                *setpoint = *voltage_limit;
-            }
-            break;
-        case EDIT_VOLTAGE_SETPOINT:
-        default:
-            *setpoint = clamp_float(*setpoint + (float)direction * VOLTAGE_SETPOINT_STEP, VOLTAGE_SETPOINT_MIN, *voltage_limit);
-            break;
-    }
+    measurements = latest_measurements;
+    settings = control_settings;
+    limits = runtime_settings;
+    overvoltage_fault = overvoltage_fault_latched;
+    overvoltage_fault2 = overvoltage_fault2_latched;
+    overcurrent_fault = overcurrent_fault_latched;
+    overcurrent_fault2 = overcurrent_fault2_latched;
+    edit_mode = encoder_edit_mode[0];
+    edit_mode2 = encoder_edit_mode[1];
     taskEXIT_CRITICAL();
-}
 
-static void encoder_select_next_parameter(uint8_t encoder_index) {
-    taskENTER_CRITICAL();
-    encoder_edit_mode[encoder_index] = (encoder_edit_mode_t)((encoder_edit_mode[encoder_index] + 1U) % EDIT_MODE_COUNT);
-    taskEXIT_CRITICAL();
-}
-
-static void encoder_toggle_output(uint8_t encoder_index) {
-    taskENTER_CRITICAL();
-    if (encoder_index == 0U) {
-        if (overcurrent_fault_latched || overvoltage_fault_latched) {
-            overcurrent_fault_latched = false;
-            overvoltage_fault_latched = false;
-            control_settings.output_enabled = false;
-        } else {
-            control_settings.output_enabled = !control_settings.output_enabled;
-        }
-    } else {
-        if (overcurrent_fault2_latched || overvoltage_fault2_latched) {
-            overcurrent_fault2_latched = false;
-            overvoltage_fault2_latched = false;
-            control_settings.output_enabled2 = false;
-        } else {
-            control_settings.output_enabled2 = !control_settings.output_enabled2;
-        }
-    }
-    taskEXIT_CRITICAL();
-}
-
-static void latch_overvoltage_fault(void) {
-    taskENTER_CRITICAL();
-    overvoltage_fault_latched = true;
-    control_settings.output_enabled = false;
-    pwm_set_chan_level(pwm_gen_slice, pwm_gen_channel, 0U);
-    actual_duty_percent = 0.0f;
-    taskEXIT_CRITICAL();
-}
-
-static void latch_overvoltage_fault2(void) {
-    taskENTER_CRITICAL();
-    overvoltage_fault2_latched = true;
-    control_settings.output_enabled2 = false;
-    pwm_set_chan_level(pwm_gen_slice, pwm_gen2_channel, 0U);
-    actual_duty_percent2 = 0.0f;
-    taskEXIT_CRITICAL();
-}
-
-static system_snapshot_t get_system_snapshot(void) {
-    system_snapshot_t snapshot;
-    taskENTER_CRITICAL();
-    snapshot.measurements = latest_measurements;
-    snapshot.duty_percent = actual_duty_percent;
-    snapshot.duty_percent2 = actual_duty_percent2;
-    snapshot.voltage_setpoint = control_settings.voltage_setpoint;
-    snapshot.voltage_setpoint2 = control_settings.voltage_setpoint2;
-    snapshot.output_enabled = control_settings.output_enabled;
-    snapshot.output_enabled2 = control_settings.output_enabled2;
-    snapshot.overvoltage_fault = overvoltage_fault_latched;
-    snapshot.overvoltage_fault2 = overvoltage_fault2_latched;
-    snapshot.overcurrent_fault = overcurrent_fault_latched;
-    snapshot.overcurrent_fault2 = overcurrent_fault2_latched;
-    snapshot.overcurrent_limit = runtime_settings.overcurrent_limit;
-    snapshot.overcurrent_limit2 = runtime_settings.overcurrent_limit2;
-    snapshot.overvoltage_limit = runtime_settings.overvoltage_limit;
-    snapshot.overvoltage_limit2 = runtime_settings.overvoltage_limit2;
-    snapshot.edit_mode = (uint8_t)encoder_edit_mode[0];
-    snapshot.edit_mode2 = (uint8_t)encoder_edit_mode[1];
-    taskEXIT_CRITICAL();
-    return snapshot;
-}
-
-static void lcd_show_values(const system_snapshot_t *snapshot) {
     char line[21];
     char voltage_pos[6];
     char voltage_neg[6];
@@ -409,40 +246,40 @@ static void lcd_show_values(const system_snapshot_t *snapshot) {
     const char *state_pos = "OF";
     const char *state_neg = "OF";
 
-    if (snapshot->output_enabled) {
+    if (settings.output_enabled) {
         state_pos = "ON";
     }
-    if (snapshot->output_enabled2) {
+    if (settings.output_enabled2) {
         state_neg = "ON";
     }
 
-    snprintf(line, sizeof(line), "Vi:%5.2f -%s +%s    ", snapshot->measurements.vin, state_neg, state_pos);
+    snprintf(line, sizeof(line), "Vi:%5.2f -%s +%s    ", measurements.vin, state_neg, state_pos);
     lcd_set_cursor(0, 0);
     lcd_string(line);
 
-    if (snapshot->overvoltage_fault) {
+    if (overvoltage_fault) {
         snprintf(voltage_pos, sizeof(voltage_pos), "**OV*");
     } else {
-        snprintf(voltage_pos, sizeof(voltage_pos), "%5.2f", snapshot->measurements.vout);
+        snprintf(voltage_pos, sizeof(voltage_pos), "%5.2f", measurements.vout);
     }
-    if (snapshot->overvoltage_fault2) {
+    if (overvoltage_fault2) {
         snprintf(voltage_neg, sizeof(voltage_neg), "**OV*");
     } else {
-        snprintf(voltage_neg, sizeof(voltage_neg), "%5.2f", snapshot->measurements.vout2);
+        snprintf(voltage_neg, sizeof(voltage_neg), "%5.2f", measurements.vout2);
     }
     snprintf(line, sizeof(line), "V-:%s V+:%s   ", voltage_neg, voltage_pos);
     lcd_set_cursor(1, 0);
     lcd_string(line);
 
-    if (snapshot->overcurrent_fault) {
+    if (overcurrent_fault) {
         snprintf(current_pos, sizeof(current_pos), "**OC*");
     } else {
-        snprintf(current_pos, sizeof(current_pos), "%5.2f", snapshot->measurements.iout);
+        snprintf(current_pos, sizeof(current_pos), "%5.2f", measurements.iout);
     }
-    if (snapshot->overcurrent_fault2) {
+    if (overcurrent_fault2) {
         snprintf(current_neg, sizeof(current_neg), "**OC*");
     } else {
-        snprintf(current_neg, sizeof(current_neg), "%5.2f", snapshot->measurements.iout2);
+        snprintf(current_neg, sizeof(current_neg), "%5.2f", measurements.iout2);
     }
     snprintf(line, sizeof(line), "I-:%s I+:%s   ", current_neg, current_pos);
     lcd_set_cursor(2, 0);
@@ -450,19 +287,19 @@ static void lcd_show_values(const system_snapshot_t *snapshot) {
 
     char edit_pos[10];
     char edit_neg[10];
-    if (snapshot->edit_mode == EDIT_CURRENT_LIMIT) {
-        snprintf(edit_pos, sizeof(edit_pos), "IL+:%4.2f", snapshot->overcurrent_limit);
-    } else if (snapshot->edit_mode == EDIT_OVERVOLTAGE_LIMIT) {
-        snprintf(edit_pos, sizeof(edit_pos), "OV+:%4.1f", snapshot->overvoltage_limit);
+    if (edit_mode == EDIT_CURRENT_LIMIT) {
+        snprintf(edit_pos, sizeof(edit_pos), "IL+:%4.2f", limits.overcurrent_limit);
+    } else if (edit_mode == EDIT_OVERVOLTAGE_LIMIT) {
+        snprintf(edit_pos, sizeof(edit_pos), "OV+:%4.1f", limits.overvoltage_limit);
     } else {
-        snprintf(edit_pos, sizeof(edit_pos), "V+:%4.1f", snapshot->voltage_setpoint);
+        snprintf(edit_pos, sizeof(edit_pos), "V+:%4.1f", settings.voltage_setpoint);
     }
-    if (snapshot->edit_mode2 == EDIT_CURRENT_LIMIT) {
-        snprintf(edit_neg, sizeof(edit_neg), "IL-:%4.2f", snapshot->overcurrent_limit2);
-    } else if (snapshot->edit_mode2 == EDIT_OVERVOLTAGE_LIMIT) {
-        snprintf(edit_neg, sizeof(edit_neg), "OV-:%4.1f", snapshot->overvoltage_limit2);
+    if (edit_mode2 == EDIT_CURRENT_LIMIT) {
+        snprintf(edit_neg, sizeof(edit_neg), "IL-:%4.2f", limits.overcurrent_limit2);
+    } else if (edit_mode2 == EDIT_OVERVOLTAGE_LIMIT) {
+        snprintf(edit_neg, sizeof(edit_neg), "OV-:%4.1f", limits.overvoltage_limit2);
     } else {
-        snprintf(edit_neg, sizeof(edit_neg), "V-:%4.1f", snapshot->voltage_setpoint2);
+        snprintf(edit_neg, sizeof(edit_neg), "V-:%4.1f", settings.voltage_setpoint2);
     }
     snprintf(line, sizeof(line), "%-9s%-9s  ", edit_neg, edit_pos);
     lcd_set_cursor(3, 0);
@@ -473,143 +310,90 @@ static void lcd_show_values(const system_snapshot_t *snapshot) {
 // Medición y protección
 // =====================================================
 
-static void adc_fifo_irq_handler(void) {
-    while (!adc_fifo_is_empty()) {
-        uint16_t raw = adc_fifo_get() & 0x0FFFU;
-        if (!adc_sample_valid) {
+static uint16_t adc_read_channel(uint8_t channel) {
+    adc_select_input(channel);
+    return adc_read();
+}
+
+static void read_measurements(power_measurements_t *measurements) {
+    runtime_settings_t limits;
+
+    taskENTER_CRITICAL();
+    measurements->vin_raw = adc_latest_raw[VIN_ADC_CHANNEL];
+    measurements->iout_raw = adc_latest_raw[IOUT1_ADC_CHANNEL];
+    measurements->iout2_raw = adc_latest_raw[IOUT2_ADC_CHANNEL];
+    limits = runtime_settings;
+    taskEXIT_CRITICAL();
+
+    measurements->vin = vin_from_adc_raw(measurements->vin_raw);
+    measurements->iout = (((float)measurements->iout_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_POS_ZERO_VOLTS) / (CURRENT_SHUNT_OHMS * CURRENT_SENSE_GAIN);
+    measurements->iout2 = (((float)measurements->iout2_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_NEG_ZERO_VOLTS) / (CURRENT2_SHUNT_OHMS * CURRENT2_SENSE_GAIN);
+    if (measurements->iout < CURRENT_ZERO_DEADBAND_AMPS) {
+        measurements->iout = 0.0f;
+    }
+    if (measurements->iout2 < CURRENT_ZERO_DEADBAND_AMPS) {
+        measurements->iout2 = 0.0f;
+    }
+
+    measurements->valid = false;
+    measurements->valid2 = false;
+    for (uint8_t channel = ADS_CH_VOUT1; channel <= ADS_CH_VOUT2; channel++) {
+        uint16_t config = 0x8000U;
+        config |= (uint16_t)((0x04U | channel) << 12);
+        config |= ADS1115_PGA_BITS | 0x0100U | ADS1115_DR_BITS | 0x0003U;
+        uint8_t config_data[3] = {ADS1115_REG_CONFIG, (uint8_t)(config >> 8), (uint8_t)config};
+
+        xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+        int written = i2c_write_timeout_us(I2C_PORT, ADS1115_ADDR, config_data, 3, false, I2C_TIMEOUT_US);
+        xSemaphoreGive(i2c_mutex);
+        if (written != 3) {
             continue;
         }
-        if (adc_active_channel == IOUT1_ADC_CHANNEL && actual_duty_percent > 0.0f && raw >= overcurrent_raw_limit) {
-            overcurrent_fault_latched = true;
-            pwm_set_chan_level(pwm_gen_slice, pwm_gen_channel, 0U);
-            actual_duty_percent = 0.0f;
-        } else if (adc_active_channel == IOUT2_ADC_CHANNEL && actual_duty_percent2 > 0.0f && raw >= overcurrent_raw_limit2) {
-            overcurrent_fault2_latched = true;
-            pwm_set_chan_level(pwm_gen_slice, pwm_gen2_channel, 0U);
-            actual_duty_percent2 = 0.0f;
+
+        vTaskDelay(pdMS_TO_TICKS(ADS1115_CONV_DELAY_MS));
+        uint8_t register_address = ADS1115_REG_CONVERSION;
+        uint8_t received[2] = {0U, 0U};
+        xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+        written = i2c_write_timeout_us(I2C_PORT, ADS1115_ADDR, &register_address, 1, true, I2C_TIMEOUT_US);
+        int read = -1;
+        if (written == 1) {
+            read = i2c_read_timeout_us(I2C_PORT, ADS1115_ADDR, received, 2, false, I2C_TIMEOUT_US);
         }
-    }
-}
-
-static uint16_t adc_read_channel_average(uint8_t channel, uint8_t samples) {
-    uint32_t sum = 0U;
-    adc_sample_valid = false;
-    adc_active_channel = channel;
-    adc_select_input(channel);
-    (void)adc_read();
-    (void)adc_read();
-    adc_sample_valid = true;
-    for (uint8_t i = 0U; i < samples; i++) {
-        sum += adc_read();
-    }
-    adc_sample_valid = false;
-    return (uint16_t)(sum / samples);
-}
-
-static void adc_protection_init(void) {
-    float vin_counts_per_volt = ADC_MAX_VALUE * VIN_R2_OHMS / (ADC_REFERENCE_VOLTAGE * (VIN_R1_OHMS + VIN_R2_OHMS));
-    vin_fast_drop_raw = (uint16_t)(VIN_FAST_DROP_VOLTS * vin_counts_per_volt);
-    vin_fast_drop_min_raw = (uint16_t)(VIN_FAST_DROP_MIN_VOLTS * vin_counts_per_volt);
-    overcurrent_raw_limit = current_limit_to_raw(runtime_settings.overcurrent_limit, CURRENT_SHUNT_OHMS, CURRENT_SENSE_GAIN, CURRENT_POS_ZERO_VOLTS);
-    overcurrent_raw_limit2 = current_limit_to_raw(runtime_settings.overcurrent_limit2, CURRENT2_SHUNT_OHMS, CURRENT2_SENSE_GAIN, CURRENT_NEG_ZERO_VOLTS);
-    adc_run(false);
-    adc_set_round_robin(0U);
-    adc_fifo_drain();
-    adc_fifo_setup(true, false, 1U, false, false);
-    irq_set_exclusive_handler(ADC_IRQ_FIFO, adc_fifo_irq_handler);
-    irq_set_enabled(ADC_IRQ_FIFO, true);
-    adc_irq_set_enabled(true);
-}
-
-static void read_vin_raw(power_measurements_t *measurements) {
-    measurements->vin_raw = adc_latest_raw[VIN_ADC_CHANNEL];
-    measurements->vin = vin_from_adc_raw(measurements->vin_raw);
-}
-
-static bool ads1115_start_conversion(uint8_t channel) {
-    uint16_t config = 0U;
-    config |= 0x8000U;
-    config |= (uint16_t)((0x04U | (channel & 0x03U)) << 12);
-    config |= ADS1115_PGA_BITS;
-    config |= 0x0100U;
-    config |= ADS1115_DR_BITS;
-    config |= 0x0003U;
-    uint8_t buffer[3] = {ADS1115_REG_CONFIG, (uint8_t)(config >> 8), (uint8_t)(config & 0xFFU)};
-    xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-    int written = i2c_write_timeout_us(I2C_PORT, ADS1115_ADDR, buffer, 3, false, I2C_TIMEOUT_US);
-    xSemaphoreGive(i2c_mutex);
-    return written == 3;
-}
-
-static bool ads1115_read_result(int16_t *result) {
-    uint8_t register_address = ADS1115_REG_CONVERSION;
-    uint8_t rx[2] = {0};
-    xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-    int written = i2c_write_timeout_us(I2C_PORT, ADS1115_ADDR, &register_address, 1, true, I2C_TIMEOUT_US);
-    int read = -1;
-    if (written == 1) {
-        read = i2c_read_timeout_us(I2C_PORT, ADS1115_ADDR, rx, 2, false, I2C_TIMEOUT_US);
-    }
-    xSemaphoreGive(i2c_mutex);
-    if (written != 1 || read != 2) {
-        return false;
-    }
-    *result = (int16_t)(((uint16_t)rx[0] << 8) | rx[1]);
-    return true;
-}
-
-static bool ads1115_read_channel_raw(uint8_t channel, uint16_t *raw_result) {
-    if (raw_result == NULL) {
-        return false;
-    }
-    if (!ads1115_start_conversion(channel)) {
-        return false;
-    }
-    vTaskDelay(pdMS_TO_TICKS(ADS1115_CONV_DELAY_MS));
-    int16_t raw = 0;
-    if (!ads1115_read_result(&raw)) {
-        return false;
-    }
-    if (raw < 0) {
-        raw = 0;
-    }
-    *raw_result = (uint16_t)raw;
-    return true;
-}
-
-static void read_ads_measurements_raw(power_measurements_t *measurements) {
-    runtime_settings_t settings = get_runtime_settings();
-    uint16_t vout1_raw = 0U;
-    uint16_t vout2_raw = 0U;
-    uint16_t iout1_raw = adc_latest_raw[IOUT1_ADC_CHANNEL];
-    uint16_t iout2_raw = adc_latest_raw[IOUT2_ADC_CHANNEL];
-    bool vout1_ok = ads1115_read_channel_raw(ADS_CH_VOUT1, &vout1_raw);
-    measurements->vout_raw = vout1_raw;
-    measurements->iout_raw = iout1_raw;
-    measurements->iout2_raw = iout2_raw;
-    measurements->valid = vout1_ok;
-    if (measurements->valid) {
-        measurements->vout = vout_pos_from_ads_raw(vout1_raw);
-        measurements->iout = (((float)iout1_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_POS_ZERO_VOLTS) / (CURRENT_SHUNT_OHMS * CURRENT_SENSE_GAIN);
-        if (measurements->iout < CURRENT_ZERO_DEADBAND_AMPS) {
-            measurements->iout = 0.0f;
+        xSemaphoreGive(i2c_mutex);
+        if (written != 1 || read != 2) {
+            continue;
         }
-        if (measurements->vout > settings.overvoltage_limit) {
-            latch_overvoltage_fault();
-        }
-    }
 
-    bool vout2_ok = ads1115_read_channel_raw(ADS_CH_VOUT2, &vout2_raw);
-    measurements->vout2_raw = vout2_raw;
-    measurements->valid2 = vout2_ok;
-    if (measurements->valid2) {
-        measurements->vout2 = vout_neg_from_ads_raw(vout2_raw);
-        measurements->iout2 = (((float)iout2_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_NEG_ZERO_VOLTS) / (CURRENT2_SHUNT_OHMS * CURRENT2_SENSE_GAIN);
-        if (measurements->iout2 < CURRENT_ZERO_DEADBAND_AMPS) {
-            measurements->iout2 = 0.0f;
+        int16_t signed_raw = (int16_t)(((uint16_t)received[0] << 8) | received[1]);
+        uint16_t raw = 0U;
+        if (signed_raw > 0) {
+            raw = (uint16_t)signed_raw;
         }
-        if (measurements->vout2 > settings.overvoltage_limit2) {
-            latch_overvoltage_fault2();
+
+        if (channel == ADS_CH_VOUT1) {
+            measurements->vout_raw = raw;
+            measurements->vout = vout_pos_from_ads_raw(raw);
+            measurements->valid = true;
+            if (measurements->vout > limits.overvoltage_limit) {
+                taskENTER_CRITICAL();
+                overvoltage_fault_latched = true;
+                control_settings.output_enabled = false;
+                pwm_set_chan_level(pwm_gen_slice, pwm_gen_channel, 0U);
+                actual_duty_percent = 0.0f;
+                taskEXIT_CRITICAL();
+            }
+        } else {
+            measurements->vout2_raw = raw;
+            measurements->vout2 = vout_neg_from_ads_raw(raw);
+            measurements->valid2 = true;
+            if (measurements->vout2 > limits.overvoltage_limit2) {
+                taskENTER_CRITICAL();
+                overvoltage_fault2_latched = true;
+                control_settings.output_enabled2 = false;
+                pwm_set_chan_level(pwm_gen_slice, pwm_gen2_channel, 0U);
+                actual_duty_percent2 = 0.0f;
+                taskEXIT_CRITICAL();
+            }
         }
     }
 }
@@ -696,24 +480,33 @@ static void protection_task(void *parameters) {
     const TickType_t period_ticks = pdMS_TO_TICKS(PROTECTION_PERIOD_MS);
 
     while (true) {
-        uint16_t vin_raw = adc_read_channel_average(VIN_ADC_CHANNEL, 4U);
-        uint16_t iout2_raw = adc_read_channel_average(IOUT2_ADC_CHANNEL, 4U);
-        uint16_t iout1_raw = adc_read_channel_average(IOUT1_ADC_CHANNEL, 4U);
+        uint16_t vin_raw = adc_read_channel(VIN_ADC_CHANNEL);
+        uint16_t iout2_raw = adc_read_channel(IOUT2_ADC_CHANNEL);
+        uint16_t iout1_raw = adc_read_channel(IOUT1_ADC_CHANNEL);
+        float vin = vin_from_adc_raw(vin_raw);
+        float current_pos = (((float)iout1_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_POS_ZERO_VOLTS) / (CURRENT_SHUNT_OHMS * CURRENT_SENSE_GAIN);
+        float current_neg = (((float)iout2_raw * ADC_REFERENCE_VOLTAGE / ADC_MAX_VALUE) - CURRENT_NEG_ZERO_VOLTS) / (CURRENT2_SHUNT_OHMS * CURRENT2_SENSE_GAIN);
 
         taskENTER_CRITICAL();
         adc_latest_raw[VIN_ADC_CHANNEL] = vin_raw;
         adc_latest_raw[IOUT2_ADC_CHANNEL] = iout2_raw;
         adc_latest_raw[IOUT1_ADC_CHANNEL] = iout1_raw;
 
-        if (overcurrent_fault_latched) {
+        if (control_settings.output_enabled && current_pos >= runtime_settings.overcurrent_limit) {
+            overcurrent_fault_latched = true;
             control_settings.output_enabled = false;
+            pwm_set_chan_level(pwm_gen_slice, pwm_gen_channel, 0U);
+            actual_duty_percent = 0.0f;
         }
-        if (overcurrent_fault2_latched) {
+        if (control_settings.output_enabled2 && current_neg >= runtime_settings.overcurrent_limit2) {
+            overcurrent_fault2_latched = true;
             control_settings.output_enabled2 = false;
+            pwm_set_chan_level(pwm_gen_slice, pwm_gen2_channel, 0U);
+            actual_duty_percent2 = 0.0f;
         }
 
-        bool fast_drop = (control_settings.output_enabled || control_settings.output_enabled2) && previous_vin_raw >= vin_fast_drop_min_raw && previous_vin_raw > vin_raw && (previous_vin_raw - vin_raw) >= vin_fast_drop_raw;
-        previous_vin_raw = vin_raw;
+        bool fast_drop = (control_settings.output_enabled || control_settings.output_enabled2) && previous_vin >= VIN_FAST_DROP_MIN_VOLTS && (previous_vin - vin) >= VIN_FAST_DROP_VOLTS;
+        previous_vin = vin;
         if (fast_drop) {
             overcurrent_fault_latched = true;
             overcurrent_fault2_latched = true;
@@ -740,26 +533,94 @@ static void encoder_task(void *parameters) {
     const TickType_t period_ticks = pdMS_TO_TICKS(ENCODER_PERIOD_MS);
     while (true) {
         now_ms = to_ms_since_boot(get_absolute_time());
-        int movement1 = encoder_poll_rotation(&encoders[0]);
-        int movement2 = encoder_poll_rotation(&encoders[1]);
-        if (movement1 != 0) {
-            encoder_adjust_selected(0U, movement1 * ENCODER1_DIRECTION);
-        }
-        if (movement2 != 0) {
-            encoder_adjust_selected(1U, movement2 * ENCODER2_DIRECTION);
-        }
+        int movement1 = encoder_poll_rotation(&encoders[0]) * ENCODER1_DIRECTION;
+        int movement2 = encoder_poll_rotation(&encoders[1]) * ENCODER2_DIRECTION;
         encoder_button_event_t button1 = encoder_poll_button(&encoders[0], now_ms);
         encoder_button_event_t button2 = encoder_poll_button(&encoders[1], now_ms);
+
+        taskENTER_CRITICAL();
+
+        // Encoder de la rama positiva.
+        if (movement1 != 0) {
+            switch (encoder_edit_mode[0]) {
+                case EDIT_CURRENT_LIMIT:
+                    runtime_settings.overcurrent_limit = clamp_float(
+                        runtime_settings.overcurrent_limit + (float)movement1 * CURRENT_LIMIT_STEP_AMPS,
+                        CURRENT_LIMIT_MIN_AMPS,
+                        CURRENT_LIMIT_MAX_AMPS);
+                    break;
+                case EDIT_OVERVOLTAGE_LIMIT:
+                    runtime_settings.overvoltage_limit = clamp_float(
+                        runtime_settings.overvoltage_limit + (float)movement1 * OVERVOLTAGE_LIMIT_STEP_VOLTS,
+                        OVERVOLTAGE_LIMIT_MIN_VOLTS,
+                        VOUT_OVERVOLTAGE_TRIP);
+                    if (control_settings.voltage_setpoint > runtime_settings.overvoltage_limit) {
+                        control_settings.voltage_setpoint = runtime_settings.overvoltage_limit;
+                    }
+                    break;
+                case EDIT_VOLTAGE_SETPOINT:
+                default:
+                    control_settings.voltage_setpoint = clamp_float(
+                        control_settings.voltage_setpoint + (float)movement1 * VOLTAGE_SETPOINT_STEP,
+                        VOLTAGE_SETPOINT_MIN,
+                        runtime_settings.overvoltage_limit);
+                    break;
+            }
+        }
+
+        // Encoder de la rama negativa.
+        if (movement2 != 0) {
+            switch (encoder_edit_mode[1]) {
+                case EDIT_CURRENT_LIMIT:
+                    runtime_settings.overcurrent_limit2 = clamp_float(
+                        runtime_settings.overcurrent_limit2 + (float)movement2 * CURRENT_LIMIT_STEP_AMPS,
+                        CURRENT_LIMIT_MIN_AMPS,
+                        CURRENT_LIMIT_MAX_AMPS);
+                    break;
+                case EDIT_OVERVOLTAGE_LIMIT:
+                    runtime_settings.overvoltage_limit2 = clamp_float(
+                        runtime_settings.overvoltage_limit2 + (float)movement2 * OVERVOLTAGE_LIMIT_STEP_VOLTS,
+                        OVERVOLTAGE_LIMIT_MIN_VOLTS,
+                        VOUT_OVERVOLTAGE_TRIP);
+                    if (control_settings.voltage_setpoint2 > runtime_settings.overvoltage_limit2) {
+                        control_settings.voltage_setpoint2 = runtime_settings.overvoltage_limit2;
+                    }
+                    break;
+                case EDIT_VOLTAGE_SETPOINT:
+                default:
+                    control_settings.voltage_setpoint2 = clamp_float(
+                        control_settings.voltage_setpoint2 + (float)movement2 * VOLTAGE_SETPOINT_STEP,
+                        VOLTAGE_SETPOINT_MIN,
+                        runtime_settings.overvoltage_limit2);
+                    break;
+            }
+        }
+
         if (button1 == ENCODER_BUTTON_EVENT_SHORT) {
-            encoder_select_next_parameter(0U);
+            encoder_edit_mode[0] = (encoder_edit_mode_t)((encoder_edit_mode[0] + 1U) % EDIT_MODE_COUNT);
         } else if (button1 == ENCODER_BUTTON_EVENT_LONG) {
-            encoder_toggle_output(0U);
+            if (overcurrent_fault_latched || overvoltage_fault_latched) {
+                overcurrent_fault_latched = false;
+                overvoltage_fault_latched = false;
+                control_settings.output_enabled = false;
+            } else {
+                control_settings.output_enabled = !control_settings.output_enabled;
+            }
         }
+
         if (button2 == ENCODER_BUTTON_EVENT_SHORT) {
-            encoder_select_next_parameter(1U);
+            encoder_edit_mode[1] = (encoder_edit_mode_t)((encoder_edit_mode[1] + 1U) % EDIT_MODE_COUNT);
         } else if (button2 == ENCODER_BUTTON_EVENT_LONG) {
-            encoder_toggle_output(1U);
+            if (overcurrent_fault2_latched || overvoltage_fault2_latched) {
+                overcurrent_fault2_latched = false;
+                overvoltage_fault2_latched = false;
+                control_settings.output_enabled2 = false;
+            } else {
+                control_settings.output_enabled2 = !control_settings.output_enabled2;
+            }
         }
+
+        taskEXIT_CRITICAL();
         vTaskDelayUntil(&last_wake_time, period_ticks);
     }
 }
@@ -779,15 +640,14 @@ static void adc_task(void *parameters) {
     while (true) {
         TickType_t now = xTaskGetTickCount();
         power_measurements_t raw = {0};
-        read_vin_raw(&raw);
-        read_ads_measurements_raw(&raw);
+        read_measurements(&raw);
         if (first_vin) {
             filtered.vin_raw = raw.vin_raw;
             filtered.vin = raw.vin;
             first_vin = false;
         } else {
             filtered.vin_raw = raw.vin_raw;
-            filtered.vin += VOLTAGE_FILTER_ALPHA * (raw.vin - filtered.vin);
+            filtered.vin = (filtered.vin + raw.vin) / 2.0f;
         }
         if (raw.valid) {
             filtered.vout_raw = raw.vout_raw;
@@ -797,8 +657,8 @@ static void adc_task(void *parameters) {
                 filtered.iout = raw.iout;
                 first_measurement1 = false;
             } else {
-                filtered.vout += VOLTAGE_FILTER_ALPHA * (raw.vout - filtered.vout);
-                filtered.iout += CURRENT_FILTER_ALPHA * (raw.iout - filtered.iout);
+                filtered.vout = (filtered.vout + raw.vout) / 2.0f;
+                filtered.iout = (filtered.iout + raw.iout) / 2.0f;
             }
             filtered.valid = true;
             last_measurement1_ok = now;
@@ -813,15 +673,17 @@ static void adc_task(void *parameters) {
                 filtered.iout2 = raw.iout2;
                 first_measurement2 = false;
             } else {
-                filtered.vout2 += VOLTAGE_FILTER_ALPHA * (raw.vout2 - filtered.vout2);
-                filtered.iout2 += CURRENT2_FILTER_ALPHA * (raw.iout2 - filtered.iout2);
+                filtered.vout2 = (filtered.vout2 + raw.vout2) / 2.0f;
+                filtered.iout2 = (filtered.iout2 + raw.iout2) / 2.0f;
             }
             filtered.valid2 = true;
             last_measurement2_ok = now;
         } else if (first_measurement2 || (now - last_measurement2_ok) >= stale_ticks) {
             filtered.valid2 = false;
         }
-        update_measurements(&filtered);
+        taskENTER_CRITICAL();
+        latest_measurements = filtered;
+        taskEXIT_CRITICAL();
         vTaskDelayUntil(&last_wake_time, period_ticks);
     }
 }
@@ -837,17 +699,18 @@ static void control_task(void *parameters) {
 
     while (true) {
         uint64_t now_us = time_us_64();
-        power_measurements_t m = get_latest_measurements();
-        control_settings_t s = get_control_settings();
-        runtime_settings_t limits = get_runtime_settings();
+        power_measurements_t m;
+        control_settings_t s;
         bool valid;
         bool enabled;
         bool overvoltage;
         bool overcurrent;
         float vout;
         float target;
-        float voltage_limit;
 
+        taskENTER_CRITICAL();
+        m = latest_measurements;
+        s = control_settings;
         if (negative) {
             valid = m.valid2;
             enabled = s.output_enabled2;
@@ -855,7 +718,6 @@ static void control_task(void *parameters) {
             overcurrent = overcurrent_fault2_latched;
             vout = m.vout2;
             target = s.voltage_setpoint2;
-            voltage_limit = limits.overvoltage_limit2;
         } else {
             valid = m.valid;
             enabled = s.output_enabled;
@@ -863,8 +725,8 @@ static void control_task(void *parameters) {
             overcurrent = overcurrent_fault_latched;
             vout = m.vout;
             target = s.voltage_setpoint;
-            voltage_limit = limits.overvoltage_limit;
         }
+        taskEXIT_CRITICAL();
 
         if (!valid || !enabled || overcurrent || overvoltage) {
             if (negative) {
@@ -881,14 +743,6 @@ static void control_task(void *parameters) {
         if (!was_enabled) {
             soft_start_us = now_us;
             was_enabled = true;
-        }
-
-        if (vout >= voltage_limit) {
-            if (negative)
-                latch_overvoltage_fault2();
-            else
-                latch_overvoltage_fault();
-            continue;
         }
 
         float ramp = clamp_float((float)(now_us - soft_start_us) / (1000000.0f * SOFT_START_TIME_SECONDS), 0.0f, 1.0f);
@@ -942,9 +796,24 @@ static void uart_task(void *parameters) {
                 continue;
             }
 
-            system_snapshot_t snapshot = get_system_snapshot();
             if (strcmp(command, "GET") == 0) {
-                snprintf(response, sizeof(response), "OK VI=%.2f VP=%.2f VN=-%.2f IP=%.3f IN=%.3f SP=%.2f SN=-%.2f EP=%u EN=%u OCP=%u OCN=%u OVP=%u OVN=%u ILP=%.2f ILN=%.2f VLP=%.2f VLN=%.2f\r\n", snapshot.measurements.vin, snapshot.measurements.vout, snapshot.measurements.vout2, snapshot.measurements.iout, snapshot.measurements.iout2, snapshot.voltage_setpoint, snapshot.voltage_setpoint2, (unsigned int)snapshot.output_enabled, (unsigned int)snapshot.output_enabled2, (unsigned int)snapshot.overcurrent_fault, (unsigned int)snapshot.overcurrent_fault2, (unsigned int)snapshot.overvoltage_fault, (unsigned int)snapshot.overvoltage_fault2, snapshot.overcurrent_limit, snapshot.overcurrent_limit2, snapshot.overvoltage_limit, snapshot.overvoltage_limit2);
+                power_measurements_t measurements;
+                control_settings_t settings;
+                runtime_settings_t limits;
+                bool overcurrent_fault;
+                bool overcurrent_fault2;
+                bool overvoltage_fault;
+                bool overvoltage_fault2;
+                taskENTER_CRITICAL();
+                measurements = latest_measurements;
+                settings = control_settings;
+                limits = runtime_settings;
+                overcurrent_fault = overcurrent_fault_latched;
+                overcurrent_fault2 = overcurrent_fault2_latched;
+                overvoltage_fault = overvoltage_fault_latched;
+                overvoltage_fault2 = overvoltage_fault2_latched;
+                taskEXIT_CRITICAL();
+                snprintf(response, sizeof(response), "OK VI=%.2f VP=%.2f VN=-%.2f IP=%.3f IN=%.3f SP=%.2f SN=-%.2f EP=%u EN=%u OCP=%u OCN=%u OVP=%u OVN=%u ILP=%.2f ILN=%.2f VLP=%.2f VLN=%.2f\r\n", measurements.vin, measurements.vout, measurements.vout2, measurements.iout, measurements.iout2, settings.voltage_setpoint, settings.voltage_setpoint2, (unsigned int)settings.output_enabled, (unsigned int)settings.output_enabled2, (unsigned int)overcurrent_fault, (unsigned int)overcurrent_fault2, (unsigned int)overvoltage_fault, (unsigned int)overvoltage_fault2, limits.overcurrent_limit, limits.overcurrent_limit2, limits.overvoltage_limit, limits.overvoltage_limit2);
                 uart_puts(UART_ID, response);
                 continue;
             }
@@ -989,7 +858,7 @@ static void uart_task(void *parameters) {
                     }
                 } else if (strcmp(setting, "ILP") == 0 || strcmp(setting, "ILN") == 0) {
                     bool positive = strcmp(setting, "ILP") == 0;
-                    if (!current_limit_value_valid(value)) {
+                    if (value < CURRENT_LIMIT_MIN_AMPS || value > CURRENT_LIMIT_MAX_AMPS) {
                         uart_puts(UART_ID, "ERR RANGE\r\n");
                         continue;
                     }
@@ -1002,10 +871,8 @@ static void uart_task(void *parameters) {
                     }
                     if (!output_enabled && positive) {
                         runtime_settings.overcurrent_limit = value;
-                        overcurrent_raw_limit = current_limit_to_raw(value, CURRENT_SHUNT_OHMS, CURRENT_SENSE_GAIN, CURRENT_POS_ZERO_VOLTS);
                     } else if (!output_enabled) {
                         runtime_settings.overcurrent_limit2 = value;
-                        overcurrent_raw_limit2 = current_limit_to_raw(value, CURRENT2_SHUNT_OHMS, CURRENT2_SENSE_GAIN, CURRENT_NEG_ZERO_VOLTS);
                     }
                     taskEXIT_CRITICAL();
                     if (output_enabled) {
@@ -1116,12 +983,18 @@ static void uart_task(void *parameters) {
             }
 
             if (strcmp(command, "SAVE") == 0) {
-                if (snapshot.output_enabled || snapshot.output_enabled2) {
+                control_settings_t settings;
+                runtime_settings_t limits;
+                taskENTER_CRITICAL();
+                settings = control_settings;
+                limits = runtime_settings;
+                taskEXIT_CRITICAL();
+                if (settings.output_enabled || settings.output_enabled2) {
                     uart_puts(UART_ID, "ERR OUTPUT ON\r\n");
                     continue;
                 }
-                stored_settings_t settings = {.voltage_positive = snapshot.voltage_setpoint, .voltage_negative = snapshot.voltage_setpoint2, .current_positive = snapshot.overcurrent_limit, .current_negative = snapshot.overcurrent_limit2, .overvoltage_positive = snapshot.overvoltage_limit, .overvoltage_negative = snapshot.overvoltage_limit2};
-                if (settings_storage_save(&settings)) {
+                stored_settings_t values = {.voltage_positive = settings.voltage_setpoint, .voltage_negative = settings.voltage_setpoint2, .current_positive = limits.overcurrent_limit, .current_negative = limits.overcurrent_limit2, .overvoltage_positive = limits.overvoltage_limit, .overvoltage_negative = limits.overvoltage_limit2};
+                if (settings_storage_save(&values)) {
                     uart_puts(UART_ID, "OK SAVED\r\n");
                 } else {
                     uart_puts(UART_ID, "ERR SAVE\r\n");
@@ -1140,9 +1013,8 @@ static void display_task(void *parameters) {
     TickType_t last_wake_time = xTaskGetTickCount();
     const TickType_t period_ticks = pdMS_TO_TICKS(DISPLAY_UPDATE_MS);
     while (true) {
-        system_snapshot_t snapshot = get_system_snapshot();
         xSemaphoreTake(i2c_mutex, portMAX_DELAY);
-        lcd_show_values(&snapshot);
+        lcd_show_values();
         xSemaphoreGive(i2c_mutex);
         vTaskDelayUntil(&last_wake_time, period_ticks);
     }
@@ -1201,7 +1073,6 @@ int main(void) {
     if (!pwm_generator_init(PWM_GEN_PIN, PWM_FREQUENCY_HZ)) {
         return 1;
     }
-    adc_protection_init();
     sleep_ms(1000);
     snprintf(lcd_line, sizeof(lcd_line), "%-20.20s", "Creando tareas...");
     lcd_set_cursor(3, 0);

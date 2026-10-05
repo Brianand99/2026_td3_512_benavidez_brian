@@ -87,7 +87,7 @@ La Fig.~\ref{fig:bloques_detallado}, incluida en los apéndices, resume los bloq
 
 \subsection{Raspberry Pi Pico 2W}
 
-La Raspberry Pi Pico 2W, basada en el RP2350, genera ambos PWM, mide Vin y las corrientes, recibe por I$^2$C las tensiones del ADS1115 y gestiona encoders, LCD, UART y flash. FreeRTOS separa adquisición, control e interfaz; el corte rápido por sobrecorriente se realiza desde la interrupción del ADC.
+La Raspberry Pi Pico 2W, basada en el RP2350, genera ambos PWM, mide Vin y las corrientes, recibe por I$^2$C las tensiones del ADS1115 y gestiona encoders, LCD, UART y flash. FreeRTOS separa adquisición, control e interfaz; la sobrecorriente se supervisa cada 1~ms desde la tarea de protección.
 
 \begin{figure}[!ht]
 \centering
@@ -334,7 +334,7 @@ El programa crea siete tareas. Una misma función de control se instancia dos ve
 \end{tabular}
 \end{table}
 
-El bus I$^2$C se protege con un mutex. Las mediciones, consignas, estados y fallas se copian dentro de secciones críticas breves para formar una instantánea coherente. La interrupción del FIFO del ADC corta directamente el PWM si detecta sobrecorriente y no espera la ejecución de una tarea.
+El bus I$^2$C se protege con un mutex. Cada tarea copia únicamente los datos compartidos que necesita dentro de secciones críticas breves. La tarea 	exttt{protection\_task}, que posee la máxima prioridad, comprueba la corriente cada 1~ms y corta el PWM cuando detecta una sobrecorriente.
 
 Las tareas se crean de forma explícita en \texttt{main}; así puede observarse qué función ejecuta cada una y con qué prioridad:
 
@@ -353,7 +353,7 @@ La Fig.~\ref{fig:tareas} muestra por separado las funciones de cada tarea, su pr
 
 \subsection{Tarea de medición}
 
-\texttt{protection\_task} se ejecuta cada 1~ms. Selecciona sucesivamente Vin, I$-$ e I$+$, descarta dos conversiones después de cada cambio de canal y promedia cuatro muestras válidas. Este procedimiento evita que el asentamiento del multiplexor mezcle el valor de un canal con el siguiente. \texttt{adc\_task}, cada 5~ms, toma esas lecturas internas, adquiere V$+$ y V$-$ desde el ADS1115, convierte las cinco magnitudes y publica el conjunto calibrado para las demás tareas.
+\texttt{protection\_task} se ejecuta cada 1~ms. Selecciona sucesivamente Vin, I$-$ e I$+$ y realiza una conversión directa de cada canal del ADC interno. Convierte las corrientes a amperes, las compara con los límites configurados y conserva las lecturas crudas para la adquisición general. \texttt{adc\_task}, con un período configurado de 5~ms, toma esas lecturas, adquiere V$+$ y V$-$ desde el ADS1115, aplica las calibraciones y promedia cada medición nueva con la anterior antes de publicarla.
 
 \subsection{Control PI y PWM}
 
@@ -382,15 +382,17 @@ Al habilitar una rama, su referencia interna sube desde cero hasta el valor pedi
 
 \subsection{Protecciones digitales}
 
-Durante las conversiones válidas de I$-$ e I$+$, cada muestra ingresa al FIFO y genera una interrupción. Si una corriente supera su límite ajustado, el manejador enclava la falla y lleva inmediatamente a cero el PWM de la rama afectada. Luego, \texttt{protection\_task} actualiza el estado de habilitación que utilizan la pantalla y el resto del programa. La misma tarea compara muestras consecutivas de Vin y apaga ambas ramas si detecta una caída brusca compatible con una sobrecorriente en la entrada.
+En cada ejecución, \texttt{protection\_task} lee directamente I$-$ e I$+$. Si una corriente alcanza su límite ajustado, enclava la falla, deshabilita la rama y lleva su PWM a cero. La misma tarea compara muestras consecutivas de Vin y apaga ambas ramas si detecta una caída brusca compatible con una sobrecorriente en la entrada.
 
-La sobretensión se comprueba al adquirir cada tensión con el ADS1115. Si la lectura calibrada supera el límite de su rama, se enclava la falla y su PWM se lleva a cero. El límite de sobretensión puede configurarse entre 5 y 40~V; la referencia se limita entre 5 y 30~V.
+La sobretensión se comprueba al adquirir cada tensión con el ADS1115. Si la lectura calibrada supera el límite de su rama, se enclava la falla y su PWM se lleva a cero. El límite de sobretensión puede configurarse entre 5 y 40~V; la referencia puede ajustarse entre 0 y 30~V en pasos de 0,5~V. Cuando no existe una configuración guardada, ambas referencias comienzan en 5~V.
 
-Estas protecciones son digitales. La sobrecorriente no espera a una tarea de FreeRTOS, pero todavía depende del muestreo del ADC y de su interrupción; la PCB no posee un comparador analógico dedicado ni un apagado puramente asíncrono.
+Estas protecciones son digitales. La latencia de la sobrecorriente queda determinada principalmente por el período de 1~ms de \texttt{protection\_task}, más el tiempo de lectura y ejecución. La PCB no posee un comparador analógico dedicado ni un apagado puramente asíncrono.
 
-\begin{lstlisting}[caption={Corte inmediato desde la interrupción del ADC.}]
-if (adc_active_channel == IOUT1_ADC_CHANNEL && actual_duty_percent > 0.0f && raw >= overcurrent_raw_limit) {
+\begin{lstlisting}[caption={Enclavamiento de sobrecorriente en la tarea de protección.}]
+if (control_settings.output_enabled &&
+    current_pos >= runtime_settings.overcurrent_limit) {
     overcurrent_fault_latched = true;
+    control_settings.output_enabled = false;
     pwm_set_chan_level(pwm_gen_slice, pwm_gen_channel, 0U);
     actual_duty_percent = 0.0f;
 }
@@ -400,7 +402,7 @@ Al detectarse una falla se pone en cero el canal PWM correspondiente y se deshab
 
 \subsection{Encoders y LCD}
 
-Cada encoder controla exclusivamente su rama. El giro modifica el parámetro seleccionado; una pulsación corta recorre referencia de tensión, límite de corriente, límite de sobretensión y visualización del PWM. Una pulsación larga habilita o apaga la salida, siempre que no exista una falla enclavada.
+Cada encoder controla exclusivamente su rama. El giro modifica el parámetro seleccionado; una pulsación corta recorre referencia de tensión, límite de corriente y límite de sobretensión. La lógica de selección y ajuste se encuentra directamente dentro de \texttt{encoder\_task}. Una pulsación larga habilita o apaga la salida; si existe una falla enclavada, la misma pulsación la borra y mantiene la rama apagada.
 
 El LCD conserva dos columnas: la rama negativa se presenta a la izquierda y la positiva a la derecha, en concordancia con la disposición mecánica de los encoders y bornes. La primera fila muestra Vin y los estados ON/OFF; la segunda, V$-$ y V$+$; la tercera, I$-$ e I$+$; y la cuarta muestra el parámetro seleccionado de cada encoder. Ante una falla aparecen \texttt{OV} o \texttt{OC} en la posición de la rama afectada.
 
@@ -668,15 +670,15 @@ Se demostró el funcionamiento simultáneo hasta aproximadamente $\pm30$~V con u
   \node[taskbox,fill=red!12] (protect) at (-88,58)
     {\textbf{protection\_task} \hfill \textbf{P5}\\[-1mm]
      \rule{37mm}{0.3pt}\\Período: 1 ms.\\
-     $\bullet$~Selecciona Vin, I$-$ e I$+$.\\
-     $\bullet$~Descarta dos muestras y promedia cuatro.\\
-     $\bullet$~Supervisa corriente y caída de Vin.};
+     $\bullet$~Lee Vin, I$-$ e I$+$ con el ADC interno.\\
+     $\bullet$~Compara las corrientes con sus límites.\\
+     $\bullet$~Enclava fallas y corta el PWM.};
   \node[taskbox,fill=red!12] (measure) at (-44,58)
     {\textbf{adc\_task} \hfill \textbf{P3}\\[-1mm]
      \rule{37mm}{0.3pt}\\Período: 5 ms.\\
      $\bullet$~Lee V$+$ y V$-$ con el ADS1115.\\
      $\bullet$~Convierte y calibra magnitudes.\\
-     $\bullet$~Publica las mediciones.};
+     $\bullet$~Promedia y publica las mediciones.};
   \node[taskbox,fill=green!18] (display) at (0,58)
     {\textbf{display\_task} \hfill \textbf{P1}\\[-1mm]
      \rule{37mm}{0.3pt}\\Período: 100 ms.\\
@@ -697,7 +699,7 @@ Se demostró el funcionamiento simultáneo hasta aproximadamente $\pm30$~V con u
      $\bullet$~Ordena el guardado en flash.};
 
   % Recursos de acceso directo, alineados en una fila.
-  \node[resource] (adc) at (-99,22) {ADC FIFO\\e IRQ};
+  \node[resource] (adc) at (-99,22) {ADC\\interno};
   \node[resource] (i2c) at (-22,22) {I$^2$C0\\mutex};
   \node[resource] (flash) at (52,22) {Flash\\interna};
   \node[resource] (uartres) at (99,22) {UART0\\GPIO0/1};
@@ -744,7 +746,7 @@ Se demostró el funcionamiento simultáneo hasta aproximadamente $\pm30$~V con u
   \draw[flow] (controlp.south) -- (pwmp.north);
   \draw[flow] (controln.south) -- (pwmn.north);
 \end{tikzpicture}}
-\caption{Siete tareas de FreeRTOS y recursos compartidos. \texttt{protection\_task} estabiliza la selección de canales y supervisa Vin; el corte de sobrecorriente se ejecuta directamente en la IRQ del ADC. Las líneas discontinuas indican acceso a un recurso y las flechas continuas corresponden a las salidas PWM.}
+\caption{Siete tareas de FreeRTOS y recursos compartidos. \texttt{protection\_task} lee el ADC interno y supervisa la corriente y Vin cada 1~ms. Las líneas discontinuas indican acceso a un recurso y las flechas continuas corresponden a las salidas PWM.}
 \label{fig:tareas}
 \end{figure}
 \end{landscape}
