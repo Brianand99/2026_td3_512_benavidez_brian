@@ -698,15 +698,15 @@ Se demostró el funcionamiento simultáneo hasta aproximadamente $\pm30$~V con u
 
   % Recursos de acceso directo, alineados en una fila.
   \node[resource] (adc) at (-99,22) {ADC FIFO\\e IRQ};
-  \node[resource] (i2c) at (-54,22) {I$^2$C0\\mutex};
+  \node[resource] (i2c) at (-22,22) {I$^2$C0\\mutex};
   \node[resource] (flash) at (52,22) {Flash\\interna};
   \node[resource] (uartres) at (99,22) {UART0\\GPIO0/1};
   \node[state,text width=21mm,minimum width=24mm] (shared) at (0,0) {Estado\\compartido};
 
   \draw[use] ([xshift=-10mm]protect.south) -- (adc.north);
-  \draw[use] ([xshift=6mm]measure.south) -- (-44,31) -- (-54,31) -- (i2c.north);
-  \draw[use] ([xshift=-10mm]display.south) -- (-20,31) -- (-54,31);
-  \fill[gray!75] (-54,31) circle (1mm);
+  \draw[use] ([xshift=10mm]measure.south) -- (-34,31) -- (-22,31) -- (i2c.north);
+  \draw[use] ([xshift=-10mm]display.south) -- (-10,31) -- (-22,31);
+  \fill[gray!75] (-22,31) circle (1mm);
   \draw[use] ([xshift=-10mm]uart.south) -- (72,31) -- (52,31) -- (flash.north);
   \fill[gray!75] (52,31) circle (1mm);
   \draw[use] ([xshift=12mm]uart.south) -- (uartres.north);
