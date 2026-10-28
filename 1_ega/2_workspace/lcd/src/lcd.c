@@ -3,7 +3,6 @@
 #define LCD_ENABLE_DELAY_US  1U
 #define LCD_COMMAND_DELAY_US 50U
 #define LCD_CLEAR_DELAY_US   2000U
-#define LCD_I2C_TIMEOUT_US   5000U
 
 // Puntero a I2C usado
 static i2c_inst_t *lcd_i2c;
@@ -15,7 +14,7 @@ static uint8_t addr;
  * @param val es el byte a mandar
 */
 static void i2c_write_byte(uint8_t val) {
-    (void)i2c_write_timeout_us(lcd_i2c, addr, &val, 1, false, LCD_I2C_TIMEOUT_US);
+    i2c_write_blocking(lcd_i2c, addr, &val, 1, false);
 }
 
 /**

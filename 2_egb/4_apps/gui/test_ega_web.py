@@ -106,6 +106,18 @@ class TelemetryTests(unittest.TestCase):
         self.assertLess(HTML.index('id="sn"'), HTML.index('id="vn"'))
         self.assertNotIn("<small>Consignas</small>", HTML)
 
+    def test_page_coalesces_limit_clicks_without_command_queues_or_extra_get(self):
+        self.assertIn("LIMIT_SEND_DELAY_MS", HTML)
+        self.assertIn("scheduleLimitCommand", HTML)
+        self.assertIn("clearTimeout(limitTimers.get(key))", HTML)
+        self.assertNotIn("await request(command);await request('GET',true)", HTML)
+        self.assertNotIn("controlChain", HTML)
+        self.assertNotIn("limitInFlight", HTML)
+        self.assertIn(
+            "if(pendingLimitValues.get(key)===pending)pendingLimitValues.delete(key)",
+            HTML,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
